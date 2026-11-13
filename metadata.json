@@ -1,0 +1,6 @@
+{
+  "name": "RGD LUXE — Timeless Style. Modern Luxury.",
+  "description": "Elite luxury fashion and timepieces for men and women. Featuring bespoke tailoring, haute couture, and Swiss-crafted horology.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}

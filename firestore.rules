@@ -1,0 +1,199 @@
+rules_version = '2';
+
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    // Global safety net: deny all by default
+    match /{document=**} {
+      allow read, write: if false;
+    }
+
+    function isValidId(id) {
+      return id is string && id.size() >= 1 && id.size() <= 128 && id.matches('^[a-zA-Z0-9_\\-]+$');
+    }
+
+    function incoming() {
+      return request.resource.data;
+    }
+
+    function existing() {
+      return resource.data;
+    }
+
+    function isSignedIn() {
+      return request.auth != null;
+    }
+
+    function isVerifiedUser() {
+      return isSignedIn() && request.auth.token.email_verified == true;
+    }
+
+    function isBootstrappedAdmin() {
+      return isVerifiedUser() && request.auth.token.email == 'bilaldgr88@gmail.com';
+    }
+
+    function isAdmin() {
+      return isBootstrappedAdmin() ||
+        (isVerifiedUser() && exists(/databases/$(database)/documents/admins/$(request.auth.uid)));
+    }
+
+    function productAllowedKeys() {
+      return [
+        'id',
+        'name',
+        'subtitle',
+        'category',
+        'categoryLabel',
+        'price',
+        'originalPrice',
+        'discountEnabled',
+        'discountPercentage',
+        'rating',
+        'reviewsCount',
+        'image',
+        'images',
+        'description',
+        'details',
+        'composition',
+        'sizes',
+        'colors',
+        'inStock',
+        'stockCount',
+        'isNewArrival',
+        'isBestSeller',
+        'isSpecialOffer',
+        'sku',
+        'isDemo',
+        'sortOrder',
+        'createdAt',
+        'updatedAt'
+      ];
+    }
+
+    function isValidProduct(data, productId) {
+      return data.keys().hasAll(productAllowedKeys())
+        && data.keys().hasOnly(productAllowedKeys())
+        && data.id is string && data.id == productId && data.id.size() >= 2 && data.id.size() <= 128
+        && data.name is string && data.name.size() >= 2 && data.name.size() <= 180
+        && data.subtitle is string && data.subtitle.size() <= 240
+        && data.category is string && data.category in ['men', 'women', 'watches']
+        && data.categoryLabel is string && data.categoryLabel.size() >= 1 && data.categoryLabel.size() <= 60
+        && data.price is number && data.price > 0
+        && data.originalPrice is number && data.originalPrice >= data.price
+        && data.discountEnabled is bool
+        && data.discountPercentage is number && data.discountPercentage >= 0 && data.discountPercentage <= 99
+        && data.rating is number && data.rating >= 0 && data.rating <= 5
+        && data.reviewsCount is number && data.reviewsCount >= 0
+        && data.image is string && data.image.size() >= 1 && data.image.size() <= 260000
+        && data.images is list && data.images.size() >= 1 && data.images.size() <= 6
+        && data.images[0] is string && data.images[0].size() >= 1 && data.images[0].size() <= 260000
+        && data.description is string && data.description.size() <= 4000
+        && data.details is list && data.details.size() <= 20
+        && data.composition is string && data.composition.size() <= 500
+        && data.sizes is list && data.sizes.size() >= 1 && data.sizes.size() <= 20
+        && data.sizes[0] is string && data.sizes[0].size() >= 1 && data.sizes[0].size() <= 60
+        && data.colors is list && data.colors.size() >= 1 && data.colors.size() <= 15
+        && data.colors[0] is map
+        && data.inStock is bool
+        && data.stockCount is number && data.stockCount >= 0
+        && data.isNewArrival is bool
+        && data.isBestSeller is bool
+        && data.isSpecialOffer is bool
+        && data.sku is string && data.sku.size() >= 1 && data.sku.size() <= 80
+        && data.isDemo is bool
+        && data.sortOrder is number
+        && data.createdAt is timestamp
+        && data.updatedAt is timestamp;
+    }
+
+    function isValidCatalogMeta(data) {
+      return data.keys().hasAll(['seeded', 'updatedAt'])
+        && data.keys().hasOnly(['seeded', 'updatedAt'])
+        && data.seeded is bool
+        && data.updatedAt is timestamp;
+    }
+
+    function isValidAdminRecord(data) {
+      return data.keys().hasAll(['email', 'createdAt'])
+        && data.keys().hasOnly(['email', 'createdAt'])
+        && data.email is string && data.email.size() >= 3 && data.email.size() <= 180
+        && data.createdAt is timestamp;
+    }
+
+    // Public Storefront Product Catalog (No PII; Admin-only mutations)
+    match /products/{productId} {
+      allow get: if isValidId(productId);
+      allow list: if true;
+      allow create: if isAdmin()
+        && isValidId(productId)
+        && isValidProduct(incoming(), productId)
+        && incoming().createdAt == request.time
+        && incoming().updatedAt == request.time;
+      allow update: if isAdmin()
+        && isValidId(productId)
+        && isValidProduct(incoming(), productId)
+        && incoming().id == existing().id
+        && incoming().createdAt == existing().createdAt
+        && incoming().updatedAt == request.time
+        && incoming().diff(existing()).affectedKeys().hasOnly([
+          'name',
+          'subtitle',
+          'category',
+          'categoryLabel',
+          'price',
+          'originalPrice',
+          'discountEnabled',
+          'discountPercentage',
+          'rating',
+          'reviewsCount',
+          'image',
+          'images',
+          'description',
+          'details',
+          'composition',
+          'sizes',
+          'colors',
+          'inStock',
+          'stockCount',
+          'isNewArrival',
+          'isBestSeller',
+          'isSpecialOffer',
+          'sku',
+          'isDemo',
+          'sortOrder',
+          'updatedAt'
+        ]);
+      allow delete: if isAdmin() && isValidId(productId);
+    }
+
+    // Catalog Initialization State
+    match /catalog_meta/{metaId} {
+      allow get: if isValidId(metaId) && metaId == 'state';
+      allow list: if false;
+      allow create: if isAdmin()
+        && isValidId(metaId)
+        && metaId == 'state'
+        && isValidCatalogMeta(incoming())
+        && incoming().updatedAt == request.time;
+      allow update: if isAdmin()
+        && isValidId(metaId)
+        && metaId == 'state'
+        && isValidCatalogMeta(incoming())
+        && incoming().updatedAt == request.time
+        && incoming().diff(existing()).affectedKeys().hasOnly(['seeded', 'updatedAt']);
+      allow delete: if false;
+    }
+
+    // Admin RBAC Directory (Strict PII & Role Protection)
+    match /admins/{adminUid} {
+      allow get: if isValidId(adminUid) && (isAdmin() || (isVerifiedUser() && request.auth.uid == adminUid));
+      allow list: if isAdmin();
+      allow create: if isAdmin()
+        && isValidId(adminUid)
+        && isValidAdminRecord(incoming())
+        && incoming().createdAt == request.time;
+      allow update: if false;
+      allow delete: if isBootstrappedAdmin() && isValidId(adminUid);
+    }
+  }
+}

@@ -1,0 +1,224 @@
+{
+  "entities": {
+    "Product": {
+      "title": "Product",
+      "description": "Luxury watch or couture fashion catalog item displayed on the RGD LUXE storefront.",
+      "type": "object",
+      "properties": {
+        "id": {
+          "type": "string",
+          "description": "Unique product identifier slug.",
+          "minLength": 2,
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "name": {
+          "type": "string",
+          "description": "Product display title.",
+          "minLength": 2,
+          "maxLength": 180
+        },
+        "subtitle": {
+          "type": "string",
+          "description": "Short subtitle or calibre/material highlight.",
+          "minLength": 0,
+          "maxLength": 240
+        },
+        "category": {
+          "type": "string",
+          "description": "Primary catalog category.",
+          "enum": ["men", "women", "watches"]
+        },
+        "categoryLabel": {
+          "type": "string",
+          "description": "Human-readable category label.",
+          "minLength": 1,
+          "maxLength": 60
+        },
+        "price": {
+          "type": "number",
+          "description": "Authoritative selling price in USD."
+        },
+        "originalPrice": {
+          "type": "number",
+          "description": "Original list price in USD prior to discount."
+        },
+        "discountEnabled": {
+          "type": "boolean",
+          "description": "Whether individual product discount is active."
+        },
+        "discountPercentage": {
+          "type": "number",
+          "description": "Calculated discount percentage (0-99)."
+        },
+        "rating": {
+          "type": "number",
+          "description": "Product rating from 0 to 5."
+        },
+        "reviewsCount": {
+          "type": "number",
+          "description": "Number of product reviews."
+        },
+        "image": {
+          "type": "string",
+          "description": "Primary product image URL or compressed inline data URI.",
+          "minLength": 1,
+          "maxLength": 260000
+        },
+        "images": {
+          "type": "array",
+          "description": "Ordered product gallery images (max 6)."
+        },
+        "description": {
+          "type": "string",
+          "description": "Detailed product narrative.",
+          "minLength": 0,
+          "maxLength": 4000
+        },
+        "details": {
+          "type": "array",
+          "description": "Product specification bullet points."
+        },
+        "composition": {
+          "type": "string",
+          "description": "Material and craftsmanship composition.",
+          "minLength": 0,
+          "maxLength": 500
+        },
+        "sizes": {
+          "type": "array",
+          "description": "Available sizes or case diameters."
+        },
+        "colors": {
+          "type": "array",
+          "description": "Available color swatches with name and hex."
+        },
+        "inStock": {
+          "type": "boolean",
+          "description": "Whether the product has positive inventory."
+        },
+        "stockCount": {
+          "type": "number",
+          "description": "Available inventory units."
+        },
+        "isNewArrival": {
+          "type": "boolean",
+          "description": "Featured in New Arrivals sections."
+        },
+        "isBestSeller": {
+          "type": "boolean",
+          "description": "Featured in Best Sellers sections."
+        },
+        "isSpecialOffer": {
+          "type": "boolean",
+          "description": "Featured in Private Offers."
+        },
+        "sku": {
+          "type": "string",
+          "description": "Stock keeping unit reference code.",
+          "minLength": 1,
+          "maxLength": 80
+        },
+        "isDemo": {
+          "type": "boolean",
+          "description": "Indicates demonstration catalog content."
+        },
+        "sortOrder": {
+          "type": "number",
+          "description": "Timestamp-based ordering weight so new products appear first."
+        },
+        "createdAt": {
+          "type": "string",
+          "format": "date-time",
+          "description": "Server timestamp of creation."
+        },
+        "updatedAt": {
+          "type": "string",
+          "format": "date-time",
+          "description": "Server timestamp of last update."
+        }
+      },
+      "required": [
+        "id",
+        "name",
+        "subtitle",
+        "category",
+        "categoryLabel",
+        "price",
+        "originalPrice",
+        "discountEnabled",
+        "discountPercentage",
+        "rating",
+        "reviewsCount",
+        "image",
+        "images",
+        "description",
+        "details",
+        "composition",
+        "sizes",
+        "colors",
+        "inStock",
+        "stockCount",
+        "isNewArrival",
+        "isBestSeller",
+        "isSpecialOffer",
+        "sku",
+        "isDemo",
+        "sortOrder",
+        "createdAt",
+        "updatedAt"
+      ]
+    },
+    "CatalogMeta": {
+      "title": "CatalogMeta",
+      "description": "Singleton state tracking whether Cloud Firestore catalog seeding has been completed.",
+      "type": "object",
+      "properties": {
+        "seeded": {
+          "type": "boolean",
+          "description": "True once initial storefront catalog has been initialized in Firestore."
+        },
+        "updatedAt": {
+          "type": "string",
+          "format": "date-time",
+          "description": "Server timestamp of last catalog metadata update."
+        }
+      },
+      "required": ["seeded", "updatedAt"]
+    },
+    "AdminRecord": {
+      "title": "AdminRecord",
+      "description": "Authorized Firebase Admin UID entry for Role-Based Access Control.",
+      "type": "object",
+      "properties": {
+        "email": {
+          "type": "string",
+          "format": "email",
+          "description": "Verified administrator email address.",
+          "minLength": 3,
+          "maxLength": 180
+        },
+        "createdAt": {
+          "type": "string",
+          "format": "date-time",
+          "description": "Server timestamp when admin privilege was provisioned."
+        }
+      },
+      "required": ["email", "createdAt"]
+    }
+  },
+  "firestore": {
+    "/products/{productId}": {
+      "schema": { "$ref": "#/entities/Product" },
+      "description": "Persistent public catalog of RGD LUXE products managed exclusively by authorized administrators."
+    },
+    "/catalog_meta/{metaId}": {
+      "schema": { "$ref": "#/entities/CatalogMeta" },
+      "description": "Catalog initialization state so deleted seed items stay deleted across reloads."
+    },
+    "/admins/{adminUid}": {
+      "schema": { "$ref": "#/entities/AdminRecord" },
+      "description": "Server-verified administrator directory isolating RBAC privileges."
+    }
+  }
+}
