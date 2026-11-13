@@ -5,8 +5,7 @@ import crypto from 'crypto';
 import { fileURLToPath } from 'url';
 import dotenv from 'dotenv';
 import nodemailer from 'nodemailer';
-import { INITIAL_PRODUCTS, INITIAL_ORDERS } from './src/data/seedData.ts';
-import type { Product, Order, OrderItem, CustomerProfile } from './src/types/index.ts';
+import type { Product, CustomerProfile } from './src/types/index.ts';
 import {
   calculateCartTotals,
   getEffectivePrice,
@@ -21,19 +20,16 @@ import {
   validateImagePayloadBudget,
 } from './src/utils/productCatalog.ts';
 import {
-  ADMIN_SESSION_TTL_MS,
-  CUSTOMER_SESSION_TTL_MS,
-  consumeResetGrant,
   createOtpRecord,
-  generateSessionToken,
   hashPassword,
   hashToken,
   isValidEmail,
   validateStrongPassword,
-  verifyOtpAttempt,
   verifyPassword,
 } from './src/utils/authSecurity.ts';
-import type { OtpRecord } from './src/utils/authSecurity.ts';
+import { getFirebaseAdminContext } from './src/lib/firebaseAdmin.ts';
+import { StoreRepository } from './src/lib/storeRepository.ts';
+import type { SessionRecord, StoredUserRecord } from './src/lib/migrateDbToFirestore.ts';
 
 dotenv.config({ override: true });
 
@@ -57,48 +53,9 @@ if (!fs.existsSync(PRODUCT_UPLOADS_DIR)) {
 }
 
 const SESSION_COOKIE_NAME = 'rgd_session';
+const store = new StoreRepository(DB_FILE);
 
-interface StoredUser {
-  id: string;
-  email: string;
-  name: string;
-  passwordHash: string;
-  role: 'admin' | 'customer';
-  recoveryEmail?: string;
-  phone?: string;
-  address?: string;
-  city?: string;
-  postalCode?: string;
-  country?: string;
-}
-
-interface SessionRecord {
-  id: string;
-  userId: string;
-  tokenHash: string;
-  role: 'admin' | 'customer';
-  createdAt: number;
-  expiresAt: number;
-}
-
-interface DatabaseSchema {
-  products: Product[];
-  orders: Order[];
-  users: StoredUser[];
-  sessions: SessionRecord[];
-  passwordResetOtps: OtpRecord[];
-  subscribers: string[];
-  contactMessages: Array<{
-    id: string;
-    name: string;
-    email: string;
-    subject: string;
-    message: string;
-    createdAt: string;
-  }>;
-}
-
-function sanitizeUser(u: StoredUser): CustomerProfile {
+function sanitizeUser(u: StoredUserRecord): CustomerProfile {
   return {
     id: u.id,
     email: u.email,
@@ -135,118 +92,15 @@ function normalizeProductRecord(raw: Product): Product {
     image: mainImg,
     images: gallery.length > 0 ? gallery : mainImg ? [mainImg] : [],
     price: pricing.valid ? pricing.price : Math.max(1, Number(raw.price) || 1),
-    originalPrice: pricing.valid ? pricing.originalPrice : Math.max(1, Number(raw.originalPrice || raw.price) || 1),
+    originalPrice: pricing.valid
+      ? pricing.originalPrice
+      : Math.max(1, Number(raw.originalPrice || raw.price) || 1),
     discountEnabled: pricing.valid ? pricing.discountEnabled : false,
     discountPercentage: pricing.valid ? pricing.discountPercentage : 0,
     stockCount: stock,
     inStock: stock > 0,
   };
 }
-
-function loadDb(): DatabaseSchema {
-  let loaded: Partial<DatabaseSchema> | null = null;
-  if (fs.existsSync(DB_FILE)) {
-    try {
-      const data = fs.readFileSync(DB_FILE, 'utf-8');
-      loaded = JSON.parse(data);
-    } catch {
-      loaded = null;
-    }
-  }
-
-  let dirty = !loaded;
-
-  const products = (Array.isArray(loaded?.products) && loaded!.products.length > 0
-    ? loaded!.products
-    : INITIAL_PRODUCTS
-  ).map(normalizeProductRecord);
-
-  const orders: Order[] = (Array.isArray(loaded?.orders)
-    ? loaded!.orders
-    : INITIAL_ORDERS
-  ).map((o) => {
-    if (o.paymentMethod === 'card_demo' && o.paymentStatus === ('paid' as unknown as string)) {
-      dirty = true;
-      return { ...o, paymentStatus: 'demo_unpaid' as const };
-    }
-    return o;
-  });
-
-  let users: StoredUser[] = Array.isArray(loaded?.users) ? [...loaded!.users] : [];
-
-  // Security migration: remove legacy hardcoded demo admin account if present
-  const beforeLen = users.length;
-  users = users.filter((u) => u.email.toLowerCase() !== 'admin@rgdluxe.com');
-  if (users.length !== beforeLen) {
-    dirty = true;
-  }
-
-  // Migrate any legacy plaintext passwords to scrypt hashes
-  users = users.map((u) => {
-    if (!u.passwordHash || !u.passwordHash.includes(':')) {
-      dirty = true;
-      return {
-        ...u,
-        passwordHash: hashPassword(u.passwordHash || crypto.randomBytes(16).toString('hex')),
-      };
-    }
-    return u;
-  });
-
-  // Ensure initial admin account exists using backend environment variables only
-  const existingAdmin = users.find((u) => u.role === 'admin');
-  const envAdminEmail = (process.env.ADMIN_EMAIL || '').trim().toLowerCase();
-  const envAdminPassword = process.env.ADMIN_PASSWORD || '';
-  const envRecoveryEmail = (process.env.ADMIN_RECOVERY_EMAIL || '').trim().toLowerCase();
-
-  if (!existingAdmin && envAdminEmail && envAdminPassword) {
-    users.unshift({
-      id: 'usr_admin',
-      email: envAdminEmail,
-      name: 'Maison RGD Director',
-      passwordHash: hashPassword(envAdminPassword),
-      role: 'admin',
-      recoveryEmail: envRecoveryEmail || undefined,
-      city: 'New York',
-      country: 'United States',
-    });
-    dirty = true;
-  } else if (existingAdmin && !existingAdmin.recoveryEmail && envRecoveryEmail) {
-    existingAdmin.recoveryEmail = envRecoveryEmail;
-    dirty = true;
-  }
-
-  const now = Date.now();
-  const sessions: SessionRecord[] = Array.isArray(loaded?.sessions)
-    ? loaded!.sessions.filter((s) => s.expiresAt > now)
-    : [];
-
-  const passwordResetOtps: OtpRecord[] = Array.isArray(loaded?.passwordResetOtps)
-    ? loaded!.passwordResetOtps.filter((o) => now - o.createdAt < 24 * 60 * 60 * 1000)
-    : [];
-
-  const schema: DatabaseSchema = {
-    products,
-    orders,
-    users,
-    sessions,
-    passwordResetOtps,
-    subscribers: Array.isArray(loaded?.subscribers) ? loaded!.subscribers : [],
-    contactMessages: Array.isArray(loaded?.contactMessages) ? loaded!.contactMessages : [],
-  };
-
-  if (dirty || !fs.existsSync(DB_FILE)) {
-    fs.writeFileSync(DB_FILE, JSON.stringify(schema, null, 2));
-  }
-
-  return schema;
-}
-
-function saveDb(data: DatabaseSchema) {
-  fs.writeFileSync(DB_FILE, JSON.stringify(data, null, 2));
-}
-
-const db = loadDb();
 
 interface FirebaseConfigFile {
   projectId?: string;
@@ -267,6 +121,10 @@ function loadFirebaseConfig(): FirebaseConfigFile | null {
 let lastFirestoreSyncAt = 0;
 
 async function syncProductsFromFirestoreRest(force = false): Promise<boolean> {
+  if (store.getStatus().mode === 'firestore') {
+    return false;
+  }
+
   const now = Date.now();
   if (!force && now - lastFirestoreSyncAt < 3000) {
     return false;
@@ -292,7 +150,7 @@ async function syncProductsFromFirestoreRest(force = false): Promise<boolean> {
       const url = `${baseUrl}/products?pageSize=200${pageToken ? `&pageToken=${encodeURIComponent(pageToken)}` : ''}&key=${encodeURIComponent(cfg.apiKey)}`;
       const res = await fetch(url);
       if (!res.ok) break;
-      const payload = await res.json() as { documents?: any[]; nextPageToken?: string };
+      const payload = (await res.json()) as { documents?: any[]; nextPageToken?: string };
       if (Array.isArray(payload.documents)) {
         for (const docItem of payload.documents) {
           const decoded = decodeFirestoreDocument(docItem);
@@ -307,8 +165,9 @@ async function syncProductsFromFirestoreRest(force = false): Promise<boolean> {
     lastFirestoreSyncAt = Date.now();
 
     if (seeded || collected.length > 0) {
-      db.products = sortCatalogProducts(collected.map(normalizeProductRecord));
-      saveDb(db);
+      await store.replaceProductsFromRestFallback(
+        sortCatalogProducts(collected.map(normalizeProductRecord))
+      );
       return true;
     }
   } catch (err) {
@@ -323,6 +182,11 @@ function setNoCacheHeaders(res: express.Response) {
   res.setHeader('Expires', '0');
 }
 
+app.use((_req, res, next) => {
+  res.setHeader('X-Content-Type-Options', 'nosniff');
+  res.setHeader('Referrer-Policy', 'strict-origin-when-cross-origin');
+  next();
+});
 app.use(express.json({ limit: '12mb' }));
 app.use('/uploads', express.static(UPLOADS_ROOT));
 app.use('/api', (_req, res, next) => {
@@ -380,60 +244,58 @@ function clearSessionCookie(req: express.Request, res: express.Response) {
   });
 }
 
-function createUserSession(req: express.Request, res: express.Response, user: StoredUser) {
-  const now = Date.now();
-  const ttl = user.role === 'admin' ? ADMIN_SESSION_TTL_MS : CUSTOMER_SESSION_TTL_MS;
-  const { token, tokenHash } = generateSessionToken();
-
-  // Prune expired sessions
-  db.sessions = db.sessions.filter((s) => s.expiresAt > now);
-  db.sessions.push({
-    id: 'sess_' + crypto.randomBytes(8).toString('hex'),
-    userId: user.id,
-    tokenHash,
-    role: user.role,
-    createdAt: now,
-    expiresAt: now + ttl,
-  });
-  saveDb(db);
-  setSessionCookie(req, res, token, ttl);
+async function createUserSession(req: express.Request, res: express.Response, user: StoredUserRecord) {
+  const { rawToken, ttlMs } = await store.createSession(user);
+  setSessionCookie(req, res, rawToken, ttlMs);
 }
 
-function getAuthContext(req: express.Request): { user: StoredUser; session: SessionRecord } | null {
+async function getAuthContext(
+  req: express.Request
+): Promise<{ user: StoredUserRecord; session: SessionRecord } | null> {
   const cookies = parseCookies(req);
   const rawToken = cookies[SESSION_COOKIE_NAME];
   if (!rawToken) return null;
-
   const incomingHash = hashToken(rawToken);
-  const now = Date.now();
-  const session = db.sessions.find((s) => s.tokenHash === incomingHash && s.expiresAt > now);
-  if (!session) return null;
-
-  const user = db.users.find((u) => u.id === session.userId);
-  if (!user) return null;
-
-  return { user, session };
+  return await store.getAuthContextByTokenHash(incomingHash);
 }
 
-function requireAuth(req: express.Request, res: express.Response, next: express.NextFunction) {
-  const auth = getAuthContext(req);
-  if (!auth) {
-    return res.status(401).json({ error: 'Authentication required. Please sign in.' });
+async function requireAuth(
+  req: express.Request,
+  res: express.Response,
+  next: express.NextFunction
+) {
+  try {
+    const auth = await getAuthContext(req);
+    if (!auth) {
+      return res.status(401).json({ error: 'Authentication required. Please sign in.' });
+    }
+    (req as any).auth = auth;
+    return next();
+  } catch (err) {
+    console.error('[Auth Error]', (err as Error)?.message || err);
+    return res.status(500).json({ error: 'Authentication verification failed.' });
   }
-  (req as any).auth = auth;
-  return next();
 }
 
-function requireAdmin(req: express.Request, res: express.Response, next: express.NextFunction) {
-  const auth = getAuthContext(req);
-  if (!auth) {
-    return res.status(401).json({ error: 'Administrator authentication required.' });
+async function requireAdmin(
+  req: express.Request,
+  res: express.Response,
+  next: express.NextFunction
+) {
+  try {
+    const auth = await getAuthContext(req);
+    if (!auth) {
+      return res.status(401).json({ error: 'Administrator authentication required.' });
+    }
+    if (auth.user.role !== 'admin') {
+      return res.status(403).json({ error: 'Access denied: Administrator privileges required.' });
+    }
+    (req as any).auth = auth;
+    return next();
+  } catch (err) {
+    console.error('[Admin Auth Error]', (err as Error)?.message || err);
+    return res.status(500).json({ error: 'Administrator verification failed.' });
   }
-  if (auth.user.role !== 'admin') {
-    return res.status(403).json({ error: 'Access denied: Administrator privileges required.' });
-  }
-  (req as any).auth = auth;
-  return next();
 }
 
 // --- RATE LIMITING ---
@@ -452,7 +314,12 @@ function getClientIp(req: express.Request): string {
   return req.ip || 'unknown';
 }
 
-function checkRateLimit(map: Map<string, RateLimitBucket>, key: string, maxCount: number, windowMs: number): { allowed: boolean; retryAfterSec?: number } {
+function checkRateLimit(
+  map: Map<string, RateLimitBucket>,
+  key: string,
+  maxCount: number,
+  _windowMs: number
+): { allowed: boolean; retryAfterSec?: number } {
   const now = Date.now();
   const bucket = map.get(key);
   if (!bucket || now > bucket.resetAt) {
@@ -492,7 +359,10 @@ function getEmailProviderStatus(): {
   return { configured: false, provider: 'none' };
 }
 
-async function sendRecoveryOtpEmail(toEmail: string, otpCode: string): Promise<{ sent: boolean; error?: string }> {
+async function sendRecoveryOtpEmail(
+  toEmail: string,
+  otpCode: string
+): Promise<{ sent: boolean; error?: string }> {
   const status = getEmailProviderStatus();
   if (!status.configured) {
     return {
@@ -504,7 +374,9 @@ async function sendRecoveryOtpEmail(toEmail: string, otpCode: string): Promise<{
 
   const fromAddress =
     process.env.EMAIL_FROM ||
-    (process.env.SMTP_USER ? `RGD LUXE Security <${process.env.SMTP_USER}>` : 'RGD LUXE Security <onboarding@resend.dev>');
+    (process.env.SMTP_USER
+      ? `RGD LUXE Security <${process.env.SMTP_USER}>`
+      : 'RGD LUXE Security <onboarding@resend.dev>');
 
   const subject = 'RGD LUXE Admin Security Verification Code';
   const html = `
@@ -573,97 +445,130 @@ async function sendRecoveryOtpEmail(toEmail: string, otpCode: string): Promise<{
 }
 
 // --- AUTH API ---
-app.get('/api/auth/me', (req, res) => {
-  const auth = getAuthContext(req);
-  if (!auth) {
+app.get('/api/auth/me', async (req, res) => {
+  try {
+    const auth = await getAuthContext(req);
+    if (!auth) {
+      return res.json({ user: null });
+    }
+    return res.json({ user: sanitizeUser(auth.user) });
+  } catch {
     return res.json({ user: null });
   }
-  return res.json({ user: sanitizeUser(auth.user) });
 });
 
-function handleLogin(req: express.Request, res: express.Response, adminOnly: boolean) {
-  const { email, password } = req.body || {};
-  const cleanEmail = typeof email === 'string' ? email.trim().toLowerCase() : '';
-  const rawPassword = typeof password === 'string' ? password : '';
+async function handleLogin(req: express.Request, res: express.Response, adminOnly: boolean) {
+  try {
+    const { email, password } = req.body || {};
+    const cleanEmail = typeof email === 'string' ? email.trim().toLowerCase() : '';
+    const rawPassword = typeof password === 'string' ? password : '';
 
-  if (!cleanEmail || !rawPassword) {
-    return res.status(400).json({ error: 'Email and password are required.' });
+    if (!cleanEmail || !rawPassword) {
+      return res.status(400).json({ error: 'Email and password are required.' });
+    }
+
+    const ip = getClientIp(req);
+    const ipEmailKey = `${ip}:${cleanEmail}`;
+    const emailKey = `email:${cleanEmail}`;
+    const ipLimit = checkRateLimit(loginAttempts, ipEmailKey, 5, 15 * 60 * 1000);
+    const emailLimit = checkRateLimit(loginAttempts, emailKey, 10, 15 * 60 * 1000);
+    if (!ipLimit.allowed || !emailLimit.allowed) {
+      const retry = Math.max(ipLimit.retryAfterSec || 0, emailLimit.retryAfterSec || 0);
+      return res.status(429).json({
+        error: `Too many failed sign-in attempts. Please wait ${retry} seconds before trying again.`,
+      });
+    }
+
+    const user = await store.findUserByEmail(cleanEmail);
+    if (!user || !verifyPassword(rawPassword, user.passwordHash)) {
+      recordRateLimitHit(loginAttempts, ipEmailKey, 15 * 60 * 1000);
+      recordRateLimitHit(loginAttempts, emailKey, 15 * 60 * 1000);
+      return res.status(401).json({ error: 'Invalid credentials. Access denied.' });
+    }
+
+    if (adminOnly && user.role !== 'admin') {
+      recordRateLimitHit(loginAttempts, ipEmailKey, 15 * 60 * 1000);
+      recordRateLimitHit(loginAttempts, emailKey, 15 * 60 * 1000);
+      return res.status(403).json({ error: 'Access denied: Administrator privileges required.' });
+    }
+
+    clearRateLimit(loginAttempts, ipEmailKey);
+    clearRateLimit(loginAttempts, emailKey);
+    await createUserSession(req, res, user);
+
+    return res.json({ user: sanitizeUser(user) });
+  } catch (err) {
+    console.error('[Login Error]', (err as Error)?.message || err);
+    return res.status(500).json({ error: 'Authentication service failed.' });
   }
-
-  const rateKey = `${getClientIp(req)}:${cleanEmail}`;
-  const limit = checkRateLimit(loginAttempts, rateKey, 5, 15 * 60 * 1000);
-  if (!limit.allowed) {
-    return res.status(429).json({
-      error: `Too many failed sign-in attempts. Please wait ${limit.retryAfterSec} seconds before trying again.`,
-    });
-  }
-
-  const user = db.users.find((u) => u.email.toLowerCase() === cleanEmail);
-  if (!user || !verifyPassword(rawPassword, user.passwordHash)) {
-    recordRateLimitHit(loginAttempts, rateKey, 15 * 60 * 1000);
-    return res.status(401).json({ error: 'Invalid credentials. Access denied.' });
-  }
-
-  if (adminOnly && user.role !== 'admin') {
-    recordRateLimitHit(loginAttempts, rateKey, 15 * 60 * 1000);
-    return res.status(403).json({ error: 'Access denied: Administrator privileges required.' });
-  }
-
-  clearRateLimit(loginAttempts, rateKey);
-  createUserSession(req, res, user);
-
-  return res.json({ user: sanitizeUser(user) });
 }
 
 app.post('/api/auth/login', (req, res) => handleLogin(req, res, false));
 app.post('/api/auth/admin/login', (req, res) => handleLogin(req, res, true));
 
-app.post('/api/auth/register', (req, res) => {
-  const { email, password, name, phone, address, city, postalCode } = req.body || {};
-  const cleanEmail = typeof email === 'string' ? email.trim().toLowerCase() : '';
+app.post('/api/auth/register', async (req, res) => {
+  try {
+    const regKey = `reg:${getClientIp(req)}`;
+    const regLimit = checkRateLimit(otpRequests, regKey, 5, 15 * 60 * 1000);
+    if (!regLimit.allowed) {
+      return res.status(429).json({
+        error: `Too many registration attempts. Please wait ${regLimit.retryAfterSec} seconds.`,
+      });
+    }
+    recordRateLimitHit(otpRequests, regKey, 15 * 60 * 1000);
 
-  if (!name || typeof name !== 'string' || name.trim().length < 2) {
-    return res.status(400).json({ error: 'Full name is required.' });
+    const { email, password, name, phone, address, city, postalCode } = req.body || {};
+    const cleanEmail = typeof email === 'string' ? email.trim().toLowerCase() : '';
+
+    if (!name || typeof name !== 'string' || name.trim().length < 2) {
+      return res.status(400).json({ error: 'Full name is required.' });
+    }
+    if (!isValidEmail(cleanEmail)) {
+      return res.status(400).json({ error: 'Valid email address is required.' });
+    }
+    const passCheck = validateStrongPassword(password);
+    if (!passCheck.valid) {
+      return res.status(400).json({ error: passCheck.error });
+    }
+
+    const existing = await store.findUserByEmail(cleanEmail);
+    if (existing) {
+      return res.status(409).json({ error: 'An account with this email already exists.' });
+    }
+
+    const newUser: StoredUserRecord = {
+      id: 'usr_' + crypto.randomBytes(6).toString('hex'),
+      email: cleanEmail,
+      name: name.trim(),
+      passwordHash: hashPassword(password),
+      role: 'customer',
+      phone: typeof phone === 'string' ? phone.trim() : '',
+      address: typeof address === 'string' ? address.trim() : '',
+      city: typeof city === 'string' ? city.trim() : '',
+      postalCode: typeof postalCode === 'string' ? postalCode.trim() : '',
+      country: 'United States',
+    };
+
+    await store.createUser(newUser);
+    await createUserSession(req, res, newUser);
+
+    return res.status(201).json({ user: sanitizeUser(newUser) });
+  } catch (err) {
+    console.error('[Register Error]', (err as Error)?.message || err);
+    return res.status(500).json({ error: 'Account registration failed.' });
   }
-  if (!isValidEmail(cleanEmail)) {
-    return res.status(400).json({ error: 'Valid email address is required.' });
-  }
-  const passCheck = validateStrongPassword(password);
-  if (!passCheck.valid) {
-    return res.status(400).json({ error: passCheck.error });
-  }
-
-  const existing = db.users.find((u) => u.email.toLowerCase() === cleanEmail);
-  if (existing) {
-    return res.status(409).json({ error: 'An account with this email already exists.' });
-  }
-
-  const newUser: StoredUser = {
-    id: 'usr_' + crypto.randomBytes(6).toString('hex'),
-    email: cleanEmail,
-    name: name.trim(),
-    passwordHash: hashPassword(password),
-    role: 'customer',
-    phone: typeof phone === 'string' ? phone.trim() : '',
-    address: typeof address === 'string' ? address.trim() : '',
-    city: typeof city === 'string' ? city.trim() : '',
-    postalCode: typeof postalCode === 'string' ? postalCode.trim() : '',
-    country: 'United States',
-  };
-
-  db.users.push(newUser);
-  createUserSession(req, res, newUser);
-
-  return res.status(201).json({ user: sanitizeUser(newUser) });
 });
 
-app.post('/api/auth/logout', (req, res) => {
-  const cookies = parseCookies(req);
-  const rawToken = cookies[SESSION_COOKIE_NAME];
-  if (rawToken) {
-    const incomingHash = hashToken(rawToken);
-    db.sessions = db.sessions.filter((s) => s.tokenHash !== incomingHash);
-    saveDb(db);
+app.post('/api/auth/logout', async (req, res) => {
+  try {
+    const cookies = parseCookies(req);
+    const rawToken = cookies[SESSION_COOKIE_NAME];
+    if (rawToken) {
+      const incomingHash = hashToken(rawToken);
+      await store.deleteSessionByTokenHash(incomingHash);
+    }
+  } catch {
+    // ensure cookie still clears
   }
   clearSessionCookie(req, res);
   return res.json({ success: true });
@@ -671,128 +576,162 @@ app.post('/api/auth/logout', (req, res) => {
 
 // --- REAL FORGOT-PASSWORD EMAIL OTP RECOVERY ---
 app.post('/api/auth/forgot-password/request-otp', async (req, res) => {
-  const emailProvider = getEmailProviderStatus();
-  if (!emailProvider.configured) {
-    return res.status(503).json({
-      error:
-        'Password recovery email service is not configured yet. Set RESEND_API_KEY or SMTP_* variables on the server before requesting an OTP.',
-    });
-  }
+  try {
+    const emailProvider = getEmailProviderStatus();
+    if (!emailProvider.configured) {
+      return res.status(503).json({
+        error:
+          'Password recovery email service is not configured yet. Set RESEND_API_KEY or SMTP_* variables on the server before requesting an OTP.',
+      });
+    }
 
-  const { email } = req.body || {};
-  const cleanEmail = typeof email === 'string' ? email.trim().toLowerCase() : '';
-  if (!isValidEmail(cleanEmail)) {
-    return res.status(400).json({ error: 'Please enter a valid email address.' });
-  }
+    const { email } = req.body || {};
+    const cleanEmail = typeof email === 'string' ? email.trim().toLowerCase() : '';
+    if (!isValidEmail(cleanEmail)) {
+      return res.status(400).json({ error: 'Please enter a valid email address.' });
+    }
 
-  const rateKey = `otp:${getClientIp(req)}`;
-  const limit = checkRateLimit(otpRequests, rateKey, 3, 15 * 60 * 1000);
-  if (!limit.allowed) {
-    return res.status(429).json({
-      error: `Too many OTP requests. Please wait ${limit.retryAfterSec} seconds before requesting another code.`,
-    });
-  }
-  recordRateLimitHit(otpRequests, rateKey, 15 * 60 * 1000);
+    const ipKey = `otp:${getClientIp(req)}`;
+    const emailOtpKey = `otp-email:${cleanEmail}`;
+    const ipLimit = checkRateLimit(otpRequests, ipKey, 3, 15 * 60 * 1000);
+    const emailLimit = checkRateLimit(otpRequests, emailOtpKey, 3, 15 * 60 * 1000);
+    if (!ipLimit.allowed || !emailLimit.allowed) {
+      const retry = Math.max(ipLimit.retryAfterSec || 0, emailLimit.retryAfterSec || 0);
+      return res.status(429).json({
+        error: `Too many OTP requests. Please wait ${retry} seconds before requesting another code.`,
+      });
+    }
+    recordRateLimitHit(otpRequests, ipKey, 15 * 60 * 1000);
+    recordRateLimitHit(otpRequests, emailOtpKey, 15 * 60 * 1000);
 
-  const admin = db.users.find((u) => u.role === 'admin' && u.email.toLowerCase() === cleanEmail);
-  const neutralSuccess =
-    'If this email is registered as an administrator account, a 6-digit verification code has been dispatched to the private recovery inbox. The code expires in 5 minutes.';
+    const admin = await store.findAdminByEmail(cleanEmail);
+    const neutralSuccess =
+      'If this email is registered as an administrator account, a 6-digit verification code has been dispatched to the private recovery inbox. The code expires in 5 minutes.';
 
-  if (!admin) {
+    if (!admin) {
+      return res.json({ success: true, message: neutralSuccess });
+    }
+
+    const destinationEmail = (
+      admin.recoveryEmail ||
+      process.env.ADMIN_RECOVERY_EMAIL ||
+      admin.email
+    ).trim();
+
+    const { otp, record } = createOtpRecord(admin.id, admin.email);
+    await store.replaceActiveOtpsForUser(admin.id, record);
+
+    const delivery = await sendRecoveryOtpEmail(destinationEmail, otp);
+    if (!delivery.sent) {
+      await store.markOtpUsed(record.id);
+      return res.status(502).json({
+        error: delivery.error || 'Email service failed to deliver the verification code.',
+      });
+    }
+
     return res.json({ success: true, message: neutralSuccess });
+  } catch (err) {
+    console.error('[Request OTP Error]', (err as Error)?.message || err);
+    return res.status(500).json({ error: 'Unable to process recovery OTP request.' });
   }
+});
 
-  const destinationEmail = (admin.recoveryEmail || process.env.ADMIN_RECOVERY_EMAIL || admin.email).trim();
+app.post('/api/auth/forgot-password/verify-otp', async (req, res) => {
+  try {
+    const { email, otp } = req.body || {};
+    const cleanEmail = typeof email === 'string' ? email.trim().toLowerCase() : '';
+    const cleanOtp = typeof otp === 'string' ? otp.trim() : '';
 
-  // Invalidate any previous unused OTPs for this account
-  db.passwordResetOtps = db.passwordResetOtps.map((o) =>
-    o.userId === admin.id && !o.used ? { ...o, used: true } : o
-  );
+    const verifyKey = `otp-verify:${getClientIp(req)}:${cleanEmail}`;
+    const verifyLimit = checkRateLimit(otpRequests, verifyKey, 8, 15 * 60 * 1000);
+    if (!verifyLimit.allowed) {
+      return res.status(429).json({
+        error: `Too many verification attempts. Please wait ${verifyLimit.retryAfterSec} seconds.`,
+      });
+    }
 
-  const { otp, record } = createOtpRecord(admin.id, admin.email);
-  db.passwordResetOtps.push(record);
-  saveDb(db);
+    if (!isValidEmail(cleanEmail) || !/^\d{6}$/.test(cleanOtp)) {
+      recordRateLimitHit(otpRequests, verifyKey, 15 * 60 * 1000);
+      return res
+        .status(400)
+        .json({ error: 'Valid email address and 6-digit verification code are required.' });
+    }
 
-  const delivery = await sendRecoveryOtpEmail(destinationEmail, otp);
-  if (!delivery.sent) {
-    record.used = true;
-    saveDb(db);
-    return res.status(502).json({
-      error: delivery.error || 'Email service failed to deliver the verification code.',
+    const result = await store.verifyOtp(cleanEmail, cleanOtp);
+    if (!result.success || !result.resetGrantToken) {
+      recordRateLimitHit(otpRequests, verifyKey, 15 * 60 * 1000);
+      return res.status(400).json({ error: result.error || 'Invalid or expired verification code.' });
+    }
+
+    clearRateLimit(otpRequests, verifyKey);
+    return res.json({
+      success: true,
+      resetGrantToken: result.resetGrantToken,
+      message: 'Code verified. You may now set a new strong password.',
     });
+  } catch (err) {
+    console.error('[Verify OTP Error]', (err as Error)?.message || err);
+    return res.status(500).json({ error: 'OTP verification failed.' });
   }
-
-  return res.json({ success: true, message: neutralSuccess });
 });
 
-app.post('/api/auth/forgot-password/verify-otp', (req, res) => {
-  const { email, otp } = req.body || {};
-  const cleanEmail = typeof email === 'string' ? email.trim().toLowerCase() : '';
-  const cleanOtp = typeof otp === 'string' ? otp.trim() : '';
+app.post('/api/auth/forgot-password/reset-password', async (req, res) => {
+  try {
+    const { email, resetGrantToken, newPassword, confirmPassword } = req.body || {};
+    const cleanEmail = typeof email === 'string' ? email.trim().toLowerCase() : '';
 
-  if (!isValidEmail(cleanEmail) || !/^\d{6}$/.test(cleanOtp)) {
-    return res.status(400).json({ error: 'Valid email address and 6-digit verification code are required.' });
+    const resetKey = `otp-reset:${getClientIp(req)}:${cleanEmail}`;
+    const resetLimit = checkRateLimit(otpRequests, resetKey, 5, 15 * 60 * 1000);
+    if (!resetLimit.allowed) {
+      return res.status(429).json({
+        error: `Too many password reset attempts. Please wait ${resetLimit.retryAfterSec} seconds.`,
+      });
+    }
+
+    if (!isValidEmail(cleanEmail)) {
+      recordRateLimitHit(otpRequests, resetKey, 15 * 60 * 1000);
+      return res.status(400).json({ error: 'Valid email address is required.' });
+    }
+    if (!newPassword || newPassword !== confirmPassword) {
+      return res.status(400).json({ error: 'New password and confirmation do not match.' });
+    }
+    const strength = validateStrongPassword(newPassword);
+    if (!strength.valid) {
+      return res.status(400).json({ error: strength.error });
+    }
+
+    const result = await store.consumeResetGrantAndUpdateAdminPassword({
+      email: cleanEmail,
+      resetGrantToken: resetGrantToken || '',
+      newPasswordHash: hashPassword(newPassword),
+    });
+
+    if (!result.valid) {
+      recordRateLimitHit(otpRequests, resetKey, 15 * 60 * 1000);
+      return res
+        .status(400)
+        .json({ error: result.error || 'Verified OTP session is invalid or expired.' });
+    }
+
+    clearRateLimit(otpRequests, resetKey);
+    clearSessionCookie(req, res);
+
+    return res.json({
+      success: true,
+      message: 'Administrator password has been reset. Please sign in with your new password.',
+    });
+  } catch (err) {
+    console.error('[Reset Password Error]', (err as Error)?.message || err);
+    return res.status(500).json({ error: 'Password reset failed.' });
   }
-
-  const result = verifyOtpAttempt(db.passwordResetOtps, cleanEmail, cleanOtp);
-  saveDb(db);
-
-  if (!result.success || !result.resetGrantToken) {
-    return res.status(400).json({ error: result.error || 'Invalid or expired verification code.' });
-  }
-
-  return res.json({
-    success: true,
-    resetGrantToken: result.resetGrantToken,
-    message: 'Code verified. You may now set a new strong password.',
-  });
-});
-
-app.post('/api/auth/forgot-password/reset-password', (req, res) => {
-  const { email, resetGrantToken, newPassword, confirmPassword } = req.body || {};
-  const cleanEmail = typeof email === 'string' ? email.trim().toLowerCase() : '';
-
-  if (!isValidEmail(cleanEmail)) {
-    return res.status(400).json({ error: 'Valid email address is required.' });
-  }
-  if (!newPassword || newPassword !== confirmPassword) {
-    return res.status(400).json({ error: 'New password and confirmation do not match.' });
-  }
-  const strength = validateStrongPassword(newPassword);
-  if (!strength.valid) {
-    return res.status(400).json({ error: strength.error });
-  }
-
-  const grant = consumeResetGrant(db.passwordResetOtps, cleanEmail, resetGrantToken || '');
-  if (!grant.valid || !grant.userId) {
-    saveDb(db);
-    return res.status(400).json({ error: grant.error || 'Verified OTP session is invalid or expired.' });
-  }
-
-  const admin = db.users.find((u) => u.id === grant.userId && u.role === 'admin');
-  if (!admin) {
-    saveDb(db);
-    return res.status(400).json({ error: 'Account could not be updated.' });
-  }
-
-  admin.passwordHash = hashPassword(newPassword);
-  // Invalidate all existing sessions and OTPs for this admin
-  db.sessions = db.sessions.filter((s) => s.userId !== admin.id);
-  db.passwordResetOtps = db.passwordResetOtps.filter((o) => o.userId !== admin.id);
-  saveDb(db);
-  clearSessionCookie(req, res);
-
-  return res.json({
-    success: true,
-    message: 'Administrator password has been reset. Please sign in with your new password.',
-  });
 });
 
 // --- ADMIN SECURITY SETTINGS API ---
 app.get('/api/admin/settings', requireAdmin, (req, res) => {
-  const auth = (req as any).auth as { user: StoredUser };
+  const auth = (req as any).auth as { user: StoredUserRecord };
   const emailProvider = getEmailProviderStatus();
   const hasRecovery = Boolean(auth.user.recoveryEmail || process.env.ADMIN_RECOVERY_EMAIL);
+  const status = store.getStatus();
 
   return res.json({
     adminEmail: auth.user.email,
@@ -800,91 +739,139 @@ app.get('/api/admin/settings', requireAdmin, (req, res) => {
     hasPrivateRecoveryEmail: hasRecovery,
     emailServiceConfigured: emailProvider.configured,
     emailProvider: emailProvider.provider,
+    persistenceMode: status.mode,
   });
 });
 
-app.put('/api/admin/settings/email', requireAdmin, (req, res) => {
-  const auth = (req as any).auth as { user: StoredUser; session: SessionRecord };
-  const { currentPassword, newEmail } = req.body || {};
+app.put('/api/admin/settings/email', requireAdmin, async (req, res) => {
+  try {
+    const auth = (req as any).auth as { user: StoredUserRecord; session: SessionRecord };
+    const { currentPassword, newEmail } = req.body || {};
 
-  if (!currentPassword || !verifyPassword(String(currentPassword), auth.user.passwordHash)) {
-    return res.status(401).json({ error: 'Current administrator password is incorrect.' });
-  }
+    if (!currentPassword || !verifyPassword(String(currentPassword), auth.user.passwordHash)) {
+      return res.status(401).json({ error: 'Current administrator password is incorrect.' });
+    }
 
-  const cleanNewEmail = typeof newEmail === 'string' ? newEmail.trim().toLowerCase() : '';
-  if (!isValidEmail(cleanNewEmail)) {
-    return res.status(400).json({ error: 'Please enter a valid new administrator email address.' });
-  }
-  if (cleanNewEmail === auth.user.email.toLowerCase()) {
-    return res.status(400).json({ error: 'New email matches your current administrator email.' });
-  }
-  const conflict = db.users.find((u) => u.id !== auth.user.id && u.email.toLowerCase() === cleanNewEmail);
-  if (conflict) {
-    return res.status(409).json({ error: 'This email address is already associated with another account.' });
-  }
+    const cleanNewEmail = typeof newEmail === 'string' ? newEmail.trim().toLowerCase() : '';
+    if (!isValidEmail(cleanNewEmail)) {
+      return res.status(400).json({ error: 'Please enter a valid new administrator email address.' });
+    }
+    if (cleanNewEmail === auth.user.email.toLowerCase()) {
+      return res.status(400).json({ error: 'New email matches your current administrator email.' });
+    }
+    const conflict = await store.findUserByEmail(cleanNewEmail);
+    if (conflict && conflict.id !== auth.user.id) {
+      return res.status(409).json({ error: 'This email address is already associated with another account.' });
+    }
 
-  auth.user.email = cleanNewEmail;
-  // Invalidate all other sessions and issue a rotated session for current device
-  db.sessions = db.sessions.filter((s) => s.userId !== auth.user.id);
-  createUserSession(req, res, auth.user);
+    const { updatedUser, rawToken, ttlMs } = await store.updateAdminProfileAndRotateSession({
+      user: auth.user,
+      patch: { email: cleanNewEmail },
+    });
+    setSessionCookie(req, res, rawToken, ttlMs);
 
-  return res.json({
-    success: true,
-    user: sanitizeUser(auth.user),
-    message: 'Administrator email updated successfully.',
-  });
+    return res.json({
+      success: true,
+      user: sanitizeUser(updatedUser),
+      message: 'Administrator email updated successfully.',
+    });
+  } catch (err) {
+    console.error('[Update Admin Email Error]', (err as Error)?.message || err);
+    return res.status(500).json({ error: 'Failed to update administrator email.' });
+  }
 });
 
-app.put('/api/admin/settings/password', requireAdmin, (req, res) => {
-  const auth = (req as any).auth as { user: StoredUser; session: SessionRecord };
-  const { currentPassword, newPassword, confirmPassword } = req.body || {};
+app.put('/api/admin/settings/password', requireAdmin, async (req, res) => {
+  try {
+    const auth = (req as any).auth as { user: StoredUserRecord; session: SessionRecord };
+    const { currentPassword, newPassword, confirmPassword } = req.body || {};
 
-  if (!currentPassword || !verifyPassword(String(currentPassword), auth.user.passwordHash)) {
-    return res.status(401).json({ error: 'Current administrator password is incorrect.' });
-  }
-  if (!newPassword || newPassword !== confirmPassword) {
-    return res.status(400).json({ error: 'New password and confirmation do not match.' });
-  }
-  if (newPassword === currentPassword) {
-    return res.status(400).json({ error: 'New password must differ from your current password.' });
-  }
-  const strength = validateStrongPassword(newPassword);
-  if (!strength.valid) {
-    return res.status(400).json({ error: strength.error });
-  }
+    if (!currentPassword || !verifyPassword(String(currentPassword), auth.user.passwordHash)) {
+      return res.status(401).json({ error: 'Current administrator password is incorrect.' });
+    }
+    if (!newPassword || newPassword !== confirmPassword) {
+      return res.status(400).json({ error: 'New password and confirmation do not match.' });
+    }
+    if (newPassword === currentPassword) {
+      return res.status(400).json({ error: 'New password must differ from your current password.' });
+    }
+    const strength = validateStrongPassword(newPassword);
+    if (!strength.valid) {
+      return res.status(400).json({ error: strength.error });
+    }
 
-  auth.user.passwordHash = hashPassword(newPassword);
-  // Invalidate all old sessions & rotate current session
-  db.sessions = db.sessions.filter((s) => s.userId !== auth.user.id);
-  createUserSession(req, res, auth.user);
+    const { rawToken, ttlMs } = await store.updateAdminProfileAndRotateSession({
+      user: auth.user,
+      patch: { passwordHash: hashPassword(newPassword) },
+    });
+    setSessionCookie(req, res, rawToken, ttlMs);
 
-  return res.json({
-    success: true,
-    message: 'Administrator password updated and active sessions rotated.',
-  });
+    return res.json({
+      success: true,
+      message: 'Administrator password updated and active sessions rotated.',
+    });
+  } catch (err) {
+    console.error('[Update Admin Password Error]', (err as Error)?.message || err);
+    return res.status(500).json({ error: 'Failed to update administrator password.' });
+  }
 });
 
-app.put('/api/admin/settings/recovery-email', requireAdmin, (req, res) => {
-  const auth = (req as any).auth as { user: StoredUser; session: SessionRecord };
-  const { currentPassword, newRecoveryEmail } = req.body || {};
+app.put('/api/admin/settings/recovery-email', requireAdmin, async (req, res) => {
+  try {
+    const auth = (req as any).auth as { user: StoredUserRecord; session: SessionRecord };
+    const { currentPassword, newRecoveryEmail } = req.body || {};
 
-  if (!currentPassword || !verifyPassword(String(currentPassword), auth.user.passwordHash)) {
-    return res.status(401).json({ error: 'Current administrator password is incorrect.' });
+    if (!currentPassword || !verifyPassword(String(currentPassword), auth.user.passwordHash)) {
+      return res.status(401).json({ error: 'Current administrator password is incorrect.' });
+    }
+
+    const cleanRecovery =
+      typeof newRecoveryEmail === 'string' ? newRecoveryEmail.trim().toLowerCase() : '';
+    if (!isValidEmail(cleanRecovery)) {
+      return res.status(400).json({ error: 'Please enter a valid private recovery email address.' });
+    }
+
+    await store.updateAdminRecoveryEmail(auth.user.id, cleanRecovery);
+
+    return res.json({
+      success: true,
+      hasPrivateRecoveryEmail: true,
+      message: 'Private recovery email updated securely (kept hidden from public UI).',
+    });
+  } catch (err) {
+    console.error('[Update Recovery Email Error]', (err as Error)?.message || err);
+    return res.status(500).json({ error: 'Failed to update recovery email.' });
   }
+});
 
-  const cleanRecovery = typeof newRecoveryEmail === 'string' ? newRecoveryEmail.trim().toLowerCase() : '';
-  if (!isValidEmail(cleanRecovery)) {
-    return res.status(400).json({ error: 'Please enter a valid private recovery email address.' });
+app.post('/api/admin/cloud-sync-claim', requireAdmin, async (req, res) => {
+  try {
+    const { idToken } = req.body || {};
+    if (typeof idToken !== 'string' || !idToken.trim()) {
+      return res.status(400).json({ error: 'Firebase ID token is required.' });
+    }
+
+    const ctx = getFirebaseAdminContext();
+    if (!ctx.configured || !ctx.auth) {
+      return res.status(503).json({
+        error: 'Server-side Firebase Admin is not configured yet.',
+      });
+    }
+
+    const decoded = await ctx.auth.verifyIdToken(idToken.trim());
+    if (!decoded.email_verified || !decoded.email) {
+      return res.status(403).json({ error: 'Verified Google account email is required.' });
+    }
+
+    const result = await store.grantAdminCloudAccess(decoded.uid, decoded.email);
+    return res.json({
+      success: true,
+      uid: decoded.uid,
+      customClaimSet: result.customClaimSet,
+    });
+  } catch (err: any) {
+    return res.status(401).json({ error: err?.message || 'Unable to verify Firebase ID token.' });
   }
-
-  auth.user.recoveryEmail = cleanRecovery;
-  saveDb(db);
-
-  return res.json({
-    success: true,
-    hasPrivateRecoveryEmail: true,
-    message: 'Private recovery email updated securely (kept hidden from public UI).',
-  });
 });
 
 // --- ADMIN IMAGE UPLOAD API ---
@@ -896,7 +883,9 @@ app.post('/api/admin/upload-image', requireAdmin, (req, res) => {
 
   const match = dataUrl.match(/^data:image\/(jpeg|jpg|png|webp|gif);base64,([A-Za-z0-9+/=\s]+)$/i);
   if (!match) {
-    return res.status(400).json({ error: 'Unsupported image format. Upload JPG, PNG, WEBP, or GIF files.' });
+    return res
+      .status(400)
+      .json({ error: 'Unsupported image format. Upload JPG, PNG, WEBP, or GIF files.' });
   }
 
   const ext = match[1].toLowerCase() === 'jpeg' ? 'jpg' : match[1].toLowerCase();
@@ -907,7 +896,8 @@ app.post('/api/admin/upload-image', requireAdmin, (req, res) => {
     return res.status(400).json({ error: 'Image file exceeds the 5MB maximum upload limit.' });
   }
 
-  const rawBase = typeof filename === 'string' ? path.basename(filename, path.extname(filename)) : 'product';
+  const rawBase =
+    typeof filename === 'string' ? path.basename(filename, path.extname(filename)) : 'product';
   const safeBase = rawBase.replace(/[^a-zA-Z0-9_-]/g, '-').slice(0, 32) || 'product';
   const outName = `${safeBase}-${Date.now()}-${crypto.randomBytes(3).toString('hex')}.${ext}`;
   const outPath = path.join(PRODUCT_UPLOADS_DIR, outName);
@@ -918,59 +908,72 @@ app.post('/api/admin/upload-image', requireAdmin, (req, res) => {
 
 // --- PRODUCTS API ---
 app.get('/api/products', async (req, res) => {
-  if (req.query.refresh === '1') {
-    await syncProductsFromFirestoreRest(true);
-  }
-  let results = [...db.products];
-  const { category, search, sort, filter } = req.query;
+  try {
+    if (req.query.refresh === '1') {
+      await syncProductsFromFirestoreRest(true);
+    }
+    let results = await store.listProducts();
+    const { category, search, sort, filter } = req.query;
 
-  if (category && category !== 'all') {
-    results = results.filter((p) => p.category === category);
-  }
+    if (category && category !== 'all') {
+      results = results.filter((p) => p.category === category);
+    }
 
-  if (search && typeof search === 'string') {
-    const q = search.toLowerCase().trim();
-    results = results.filter(
-      (p) =>
-        p.name.toLowerCase().includes(q) ||
-        p.subtitle.toLowerCase().includes(q) ||
-        p.description.toLowerCase().includes(q) ||
-        p.categoryLabel.toLowerCase().includes(q)
-    );
-  }
+    if (search && typeof search === 'string') {
+      const q = search.toLowerCase().trim();
+      results = results.filter(
+        (p) =>
+          p.name.toLowerCase().includes(q) ||
+          p.subtitle.toLowerCase().includes(q) ||
+          p.description.toLowerCase().includes(q) ||
+          p.categoryLabel.toLowerCase().includes(q)
+      );
+    }
 
-  if (filter === 'new') {
-    results = results.filter((p) => p.isNewArrival);
-  } else if (filter === 'bestseller') {
-    results = results.filter((p) => p.isBestSeller);
-  } else if (filter === 'offer') {
-    results = results.filter((p) => p.isSpecialOffer || p.discountEnabled);
-  }
+    if (filter === 'new') {
+      results = results.filter((p) => p.isNewArrival);
+    } else if (filter === 'bestseller') {
+      results = results.filter((p) => p.isBestSeller);
+    } else if (filter === 'offer') {
+      results = results.filter((p) => p.isSpecialOffer || p.discountEnabled);
+    }
 
-  if (sort === 'price_asc') {
-    results.sort((a, b) => getEffectivePrice(a) - getEffectivePrice(b));
-  } else if (sort === 'price_desc') {
-    results.sort((a, b) => getEffectivePrice(b) - getEffectivePrice(a));
-  } else if (sort === 'rating') {
-    results.sort((a, b) => b.rating - a.rating);
-  }
+    if (sort === 'price_asc') {
+      results.sort((a, b) => getEffectivePrice(a) - getEffectivePrice(b));
+    } else if (sort === 'price_desc') {
+      results.sort((a, b) => getEffectivePrice(b) - getEffectivePrice(a));
+    } else if (sort === 'rating') {
+      results.sort((a, b) => b.rating - a.rating);
+    }
 
-  res.json({ products: results, total: results.length });
+    return res.json({ products: results, total: results.length });
+  } catch (err) {
+    console.error('[List Products Error]', (err as Error)?.message || err);
+    return res.status(500).json({ error: 'Unable to load product catalog.' });
+  }
 });
 
 app.get('/api/products/:id', async (req, res) => {
-  let prod = db.products.find((p) => p.id === req.params.id);
-  if (!prod) {
-    await syncProductsFromFirestoreRest(true);
-    prod = db.products.find((p) => p.id === req.params.id);
+  try {
+    let prod = await store.getProductById(req.params.id);
+    if (!prod) {
+      await syncProductsFromFirestoreRest(true);
+      prod = await store.getProductById(req.params.id);
+    }
+    if (!prod) {
+      return res.status(404).json({ error: 'Product not found' });
+    }
+    return res.json(prod);
+  } catch (err) {
+    console.error('[Get Product Error]', (err as Error)?.message || err);
+    return res.status(500).json({ error: 'Unable to load product details.' });
   }
-  if (!prod) {
-    return res.status(404).json({ error: 'Product not found' });
-  }
-  res.json(prod);
 });
 
-function buildValidatedProductPayload(body: any, existing?: Product): { product?: Product; error?: string } {
+async function buildValidatedProductPayload(
+  body: any,
+  existing?: Product
+): Promise<{ product?: Product; error?: string }> {
   const name = typeof body.name === 'string' ? body.name.trim() : existing?.name || '';
   if (name.length < 2) {
     return { error: 'Product name is required.' };
@@ -1002,7 +1005,8 @@ function buildValidatedProductPayload(body: any, existing?: Product): { product?
   }
 
   const requestedMain = typeof body.image === 'string' ? body.image.trim() : '';
-  const mainImage = requestedMain && uniqueImages.includes(requestedMain) ? requestedMain : uniqueImages[0];
+  const mainImage =
+    requestedMain && uniqueImages.includes(requestedMain) ? requestedMain : uniqueImages[0];
   const orderedImages = [mainImage, ...uniqueImages.filter((u) => u !== mainImage)];
   const budget = validateImagePayloadBudget(orderedImages);
   if (!budget.valid) {
@@ -1018,7 +1022,9 @@ function buildValidatedProductPayload(body: any, existing?: Product): { product?
     discountEnabled:
       body.discountEnabled !== undefined ? Boolean(body.discountEnabled) : existing?.discountEnabled,
     discountPercentage:
-      body.discountPercentage !== undefined ? Number(body.discountPercentage) : existing?.discountPercentage,
+      body.discountPercentage !== undefined
+        ? Number(body.discountPercentage)
+        : existing?.discountPercentage,
   });
 
   if (!pricing.valid) {
@@ -1030,11 +1036,15 @@ function buildValidatedProductPayload(body: any, existing?: Product): { product?
     !existing && typeof body.id === 'string' && /^[a-zA-Z0-9_-]{3,80}$/.test(body.id.trim())
       ? body.id.trim()
       : null;
-  const resolvedId =
-    existing?.id ||
-    (requestedId && !db.products.some((p) => p.id === requestedId)
-      ? requestedId
-      : 'rgd-cust-' + Date.now());
+
+  let resolvedId: string = existing?.id ?? '';
+  if (!resolvedId) {
+    if (requestedId && !(await store.hasProductId(requestedId))) {
+      resolvedId = requestedId;
+    } else {
+      resolvedId = 'rgd-cust-' + Date.now();
+    }
+  }
 
   const product: Product = {
     id: resolvedId,
@@ -1050,251 +1060,268 @@ function buildValidatedProductPayload(body: any, existing?: Product): { product?
     reviewsCount: Number(body.reviewsCount ?? existing?.reviewsCount ?? 0),
     image: mainImage,
     images: orderedImages,
-    description: typeof body.description === 'string' ? body.description.trim() : existing?.description || '',
-    details: Array.isArray(body.details) ? body.details : existing?.details || ['Bespoke Luxury Release'],
-    composition: typeof body.composition === 'string' ? body.composition : existing?.composition || '100% Bespoke Materials',
-    sizes: Array.isArray(body.sizes) && body.sizes.length > 0 ? body.sizes : existing?.sizes || ['One Size'],
+    description:
+      typeof body.description === 'string' ? body.description.trim() : existing?.description || '',
+    details: Array.isArray(body.details)
+      ? body.details
+      : existing?.details || ['Bespoke Luxury Release'],
+    composition:
+      typeof body.composition === 'string'
+        ? body.composition
+        : existing?.composition || '100% Bespoke Materials',
+    sizes:
+      Array.isArray(body.sizes) && body.sizes.length > 0 ? body.sizes : existing?.sizes || ['One Size'],
     colors:
       Array.isArray(body.colors) && body.colors.length > 0
         ? body.colors
         : existing?.colors || [{ name: 'Obsidian & Gold', hex: '#C6A45B' }],
     inStock: stockCount > 0,
     stockCount,
-    isNewArrival: body.isNewArrival !== undefined ? Boolean(body.isNewArrival) : existing?.isNewArrival ?? true,
-    isBestSeller: body.isBestSeller !== undefined ? Boolean(body.isBestSeller) : existing?.isBestSeller ?? false,
+    isNewArrival:
+      body.isNewArrival !== undefined ? Boolean(body.isNewArrival) : existing?.isNewArrival ?? true,
+    isBestSeller:
+      body.isBestSeller !== undefined ? Boolean(body.isBestSeller) : existing?.isBestSeller ?? false,
     isSpecialOffer:
       body.isSpecialOffer !== undefined
         ? Boolean(body.isSpecialOffer)
         : existing?.isSpecialOffer ?? pricing.discountEnabled,
-    sku: typeof body.sku === 'string' && body.sku.trim() ? body.sku.trim() : existing?.sku || 'RGD-CUSTOM-' + Math.floor(1000 + Math.random() * 9000),
+    sku:
+      typeof body.sku === 'string' && body.sku.trim()
+        ? body.sku.trim()
+        : existing?.sku || 'RGD-CUSTOM-' + Math.floor(1000 + Math.random() * 9000),
     isDemo: body.isDemo !== undefined ? Boolean(body.isDemo) : existing?.isDemo ?? false,
   };
 
   return { product };
 }
 
-app.post('/api/products', requireAdmin, (req, res) => {
-  const result = buildValidatedProductPayload(req.body || {});
-  if (!result.product) {
-    return res.status(400).json({ error: result.error });
-  }
+app.post('/api/products', requireAdmin, async (req, res) => {
+  try {
+    const result = await buildValidatedProductPayload(req.body || {});
+    if (!result.product) {
+      return res.status(400).json({ error: result.error });
+    }
 
-  db.products.unshift(result.product);
-  saveDb(db);
-  return res.status(201).json(result.product);
+    const created = await store.createProduct({
+      ...result.product,
+      sortOrder:
+        typeof req.body?.sortOrder === 'number' && Number.isFinite(req.body.sortOrder)
+          ? req.body.sortOrder
+          : Date.now(),
+    });
+    return res.status(201).json(created);
+  } catch (err) {
+    console.error('[Create Product Error]', (err as Error)?.message || err);
+    return res.status(500).json({ error: 'Unable to save new product.' });
+  }
 });
 
-app.put('/api/products/:id', requireAdmin, (req, res) => {
-  const idx = db.products.findIndex((p) => p.id === req.params.id);
-  if (idx === -1) {
-    return res.status(404).json({ error: 'Product not found' });
-  }
+app.put('/api/products/:id', requireAdmin, async (req, res) => {
+  try {
+    const existing = await store.getProductById(req.params.id);
+    if (!existing) {
+      return res.status(404).json({ error: 'Product not found' });
+    }
 
-  const result = buildValidatedProductPayload(req.body || {}, db.products[idx]);
-  if (!result.product) {
-    return res.status(400).json({ error: result.error });
-  }
+    const result = await buildValidatedProductPayload(req.body || {}, existing);
+    if (!result.product) {
+      return res.status(400).json({ error: result.error });
+    }
 
-  db.products[idx] = result.product;
-  saveDb(db);
-  return res.json(result.product);
+    const updated = await store.updateProduct(req.params.id, {
+      ...result.product,
+      sortOrder:
+        typeof req.body?.sortOrder === 'number' && Number.isFinite(req.body.sortOrder)
+          ? req.body.sortOrder
+          : undefined,
+    });
+    if (!updated) {
+      return res.status(404).json({ error: 'Product not found' });
+    }
+    return res.json(updated);
+  } catch (err) {
+    console.error('[Update Product Error]', (err as Error)?.message || err);
+    return res.status(500).json({ error: 'Unable to update product.' });
+  }
 });
 
-app.delete('/api/products/:id', requireAdmin, (req, res) => {
-  const initialLen = db.products.length;
-  db.products = db.products.filter((p) => p.id !== req.params.id);
-  if (db.products.length === initialLen) {
-    return res.status(404).json({ error: 'Product not found' });
+app.delete('/api/products/:id', requireAdmin, async (req, res) => {
+  try {
+    const removed = await store.deleteProduct(req.params.id);
+    if (!removed) {
+      return res.status(404).json({ error: 'Product not found' });
+    }
+    return res.json({ success: true, message: 'Product removed from collection.' });
+  } catch (err) {
+    console.error('[Delete Product Error]', (err as Error)?.message || err);
+    return res.status(500).json({ error: 'Unable to remove product.' });
   }
-  saveDb(db);
-  return res.json({ success: true, message: 'Product removed from collection.' });
 });
 
 // --- ORDERS API ---
-app.get('/api/orders', requireAuth, (req, res) => {
-  const auth = (req as any).auth as { user: StoredUser };
+app.get('/api/orders', requireAuth, async (req, res) => {
+  try {
+    const auth = (req as any).auth as { user: StoredUserRecord };
+    if (auth.user.role === 'admin') {
+      const orders = await store.listAllOrders();
+      return res.json({ orders });
+    }
 
-  if (auth.user.role === 'admin') {
-    return res.json({ orders: db.orders });
+    const ownOrders = await store.listOrdersForCustomer(auth.user.id, auth.user.email);
+    return res.json({ orders: ownOrders });
+  } catch (err) {
+    console.error('[Get Orders Error]', (err as Error)?.message || err);
+    return res.status(500).json({ error: 'Failed to retrieve orders.' });
   }
-
-  const ownOrders = db.orders.filter(
-    (o) =>
-      (o.userId && o.userId === auth.user.id) ||
-      o.customer.email.toLowerCase() === auth.user.email.toLowerCase()
-  );
-  return res.json({ orders: ownOrders });
 });
 
-app.get('/api/admin/orders', requireAdmin, (_req, res) => {
-  return res.json({ orders: db.orders });
+app.get('/api/admin/orders', requireAdmin, async (_req, res) => {
+  try {
+    const orders = await store.listAllOrders();
+    return res.json({ orders });
+  } catch (err) {
+    console.error('[Admin Orders Error]', (err as Error)?.message || err);
+    return res.status(500).json({ error: 'Failed to load orders.' });
+  }
 });
 
 app.post('/api/orders', async (req, res) => {
-  const { customer, items, paymentMethod, notes, promoCode } = req.body || {};
+  try {
+    const { customer, items, paymentMethod, notes, promoCode } = req.body || {};
 
-  const customerValidation = validateOrderInput(customer || {});
-  if (!customerValidation.valid) {
-    const firstError = Object.values(customerValidation.errors)[0] || 'Incomplete customer delivery information.';
-    return res.status(400).json({ error: firstError, errors: customerValidation.errors });
-  }
-
-  if (!Array.isArray(items) || items.length === 0) {
-    return res.status(400).json({ error: 'Cart is empty.' });
-  }
-
-  const hasMissingFromLocal = items.some((it: any) => !db.products.some((p) => p.id === it.productId));
-  if (hasMissingFromLocal) {
-    await syncProductsFromFirestoreRest(true);
-  }
-
-  const resolvedCartItems: Array<{ product: Product; quantity: number; selectedSize?: string; selectedColor?: string }> = [];
-
-  for (const item of items) {
-    const qty = Number(item.quantity);
-    if (!Number.isInteger(qty) || qty <= 0) {
-      return res.status(400).json({ error: 'Invalid item quantity.' });
+    const customerValidation = validateOrderInput(customer || {});
+    if (!customerValidation.valid) {
+      const firstError =
+        Object.values(customerValidation.errors)[0] || 'Incomplete customer delivery information.';
+      return res.status(400).json({ error: firstError, errors: customerValidation.errors });
     }
-    const prod = db.products.find((p) => p.id === item.productId);
-    if (!prod) {
-      return res.status(400).json({ error: `Product "${item.name || item.productId}" no longer exists.` });
-    }
-    if (prod.stockCount < qty) {
+
+    if (!Array.isArray(items) || items.length === 0 || items.length > 50) {
       return res.status(400).json({
-        error: `Insufficient inventory for "${prod.name}". Only ${prod.stockCount} available.`,
+        error:
+          items && items.length > 50 ? 'Too many line items in a single order.' : 'Cart is empty.',
       });
     }
-    resolvedCartItems.push({
-      product: prod,
-      quantity: qty,
-      selectedSize: typeof item.selectedSize === 'string' ? item.selectedSize : undefined,
-      selectedColor: typeof item.selectedColor === 'string' ? item.selectedColor : undefined,
-    });
-  }
 
-  // Compute authoritative totals strictly on server using DB products
-  const totals = calculateCartTotals(resolvedCartItems, typeof promoCode === 'string' ? promoCode : undefined);
-
-  // Deduct stock after all validations succeed
-  for (const resolved of resolvedCartItems) {
-    resolved.product.stockCount -= resolved.quantity;
-    if (resolved.product.stockCount <= 0) {
-      resolved.product.inStock = false;
-      resolved.product.stockCount = 0;
+    if (store.getStatus().mode !== 'firestore') {
+      const currentProducts = await store.listProducts();
+      const hasMissing = items.some((it: any) => !currentProducts.some((p) => p.id === it.productId));
+      if (hasMissing) {
+        await syncProductsFromFirestoreRest(true);
+      }
     }
+
+    const auth = await getAuthContext(req);
+    const method = paymentMethod === 'cod' ? 'cod' : 'card_demo';
+
+    const txResult = await store.createOrderTransaction({
+      items,
+      customer: {
+        name: customer.name.trim(),
+        email: customer.email.trim().toLowerCase(),
+        phone: customer.phone.trim(),
+        address: customer.address.trim(),
+        city: customer.city.trim(),
+        postalCode: customer.postalCode.trim(),
+        country: (customer.country || 'United States').trim(),
+      },
+      userId: auth?.user.id,
+      paymentMethod: method,
+      promoCode: typeof promoCode === 'string' ? promoCode : undefined,
+      notes: typeof notes === 'string' ? notes.trim().slice(0, 1000) : '',
+    });
+
+    if (!txResult.order) {
+      return res
+        .status(txResult.statusCode || 400)
+        .json({ error: txResult.error || 'Unable to place order.' });
+    }
+
+    return res.status(201).json(txResult.order);
+  } catch (err) {
+    console.error('[Create Order Error]', (err as Error)?.message || err);
+    return res.status(500).json({ error: 'Order transaction failed.' });
   }
-
-  const authoritativeItems: OrderItem[] = resolvedCartItems.map((resolved) => {
-    const effPrice = getEffectivePrice(resolved.product);
-    return {
-      productId: resolved.product.id,
-      name: resolved.product.name,
-      price: effPrice,
-      originalPrice: resolved.product.originalPrice,
-      quantity: resolved.quantity,
-      selectedSize: resolved.selectedSize,
-      selectedColor: resolved.selectedColor,
-      image: resolved.product.image,
-    };
-  });
-
-  const auth = getAuthContext(req);
-  const method = paymentMethod === 'cod' ? 'cod' : 'card_demo';
-
-  const orderNum = 'RGD-' + new Date().getFullYear() + '-' + Math.floor(10000 + Math.random() * 90000);
-  const trackNum = 'RGD-EXP-' + Math.floor(10000000 + Math.random() * 90000000);
-
-  const newOrder: Order = {
-    id: 'ord_' + Date.now() + '_' + crypto.randomBytes(2).toString('hex'),
-    orderNumber: orderNum,
-    createdAt: new Date().toISOString(),
-    userId: auth?.user.id,
-    customer: {
-      name: customer.name.trim(),
-      email: customer.email.trim().toLowerCase(),
-      phone: customer.phone.trim(),
-      address: customer.address.trim(),
-      city: customer.city.trim(),
-      postalCode: customer.postalCode.trim(),
-      country: (customer.country || 'United States').trim(),
-    },
-    items: authoritativeItems,
-    subtotal: totals.subtotal,
-    shippingFee: totals.shippingFee,
-    tax: totals.tax,
-    discount: totals.discount,
-    total: totals.total,
-    paymentMethod: method,
-    paymentStatus: method === 'cod' ? 'pending' : 'demo_unpaid',
-    orderStatus: 'Confirmed',
-    trackingNumber: trackNum,
-    notes: typeof notes === 'string' ? notes.trim() : '',
-  };
-
-  db.orders.unshift(newOrder);
-  saveDb(db);
-
-  return res.status(201).json(newOrder);
 });
 
-app.put('/api/orders/:id/status', requireAdmin, (req, res) => {
-  const order = db.orders.find((o) => o.id === req.params.id);
-  if (!order) {
-    return res.status(404).json({ error: 'Order not found' });
-  }
+app.put('/api/orders/:id/status', requireAdmin, async (req, res) => {
+  try {
+    const { status, trackingNumber } = req.body || {};
+    const allowedStatuses = ['Confirmed', 'Processing', 'Dispatched', 'Delivered', 'Cancelled'];
+    if (status && !allowedStatuses.includes(status)) {
+      return res.status(400).json({ error: 'Invalid order status.' });
+    }
 
-  const { status, trackingNumber } = req.body || {};
-  const allowedStatuses = ['Confirmed', 'Processing', 'Dispatched', 'Delivered', 'Cancelled'];
-  if (status && !allowedStatuses.includes(status)) {
-    return res.status(400).json({ error: 'Invalid order status.' });
+    const updated = await store.updateOrderStatus(req.params.id, {
+      status,
+      trackingNumber:
+        typeof trackingNumber === 'string' && trackingNumber.trim()
+          ? trackingNumber.trim()
+          : undefined,
+    });
+    if (!updated) {
+      return res.status(404).json({ error: 'Order not found' });
+    }
+    return res.json(updated);
+  } catch (err) {
+    console.error('[Update Order Status Error]', (err as Error)?.message || err);
+    return res.status(500).json({ error: 'Failed to update order status.' });
   }
-  if (status) order.orderStatus = status;
-  if (typeof trackingNumber === 'string' && trackingNumber.trim()) {
-    order.trackingNumber = trackingNumber.trim();
-  }
-
-  saveDb(db);
-  return res.json(order);
 });
 
 // --- NEWSLETTER & INQUIRY API ---
-app.post('/api/newsletter', (req, res) => {
-  const { email } = req.body || {};
-  if (!email || !isValidEmail(String(email))) {
-    return res.status(400).json({ error: 'Valid email address required.' });
+app.post('/api/newsletter', async (req, res) => {
+  try {
+    const { email } = req.body || {};
+    if (!email || !isValidEmail(String(email))) {
+      return res.status(400).json({ error: 'Valid email address required.' });
+    }
+    await store.addSubscriber(String(email));
+    return res.json({ success: true, message: 'Welcome to the RGD LUXE Private Gazette.' });
+  } catch (err) {
+    console.error('[Newsletter Error]', (err as Error)?.message || err);
+    return res.status(500).json({ error: 'Subscription could not be saved.' });
   }
-  const clean = String(email).trim().toLowerCase();
-  if (!db.subscribers.includes(clean)) {
-    db.subscribers.push(clean);
-    saveDb(db);
-  }
-  return res.json({ success: true, message: 'Welcome to the RGD LUXE Private Gazette.' });
 });
 
-app.post('/api/contact', (req, res) => {
-  const { name, email, subject, message } = req.body || {};
-  if (!name || !isValidEmail(String(email || '')) || !message) {
-    return res.status(400).json({ error: 'Valid name, email, and message are required.' });
+app.post('/api/contact', async (req, res) => {
+  try {
+    const { name, email, subject, message } = req.body || {};
+    if (!name || !isValidEmail(String(email || '')) || !message) {
+      return res.status(400).json({ error: 'Valid name, email, and message are required.' });
+    }
+    await store.addContactMessage({
+      id: 'msg_' + Date.now() + '_' + crypto.randomBytes(2).toString('hex'),
+      name: String(name).trim().slice(0, 120),
+      email: String(email).trim().toLowerCase().slice(0, 180),
+      subject: String(subject || 'General Concierge Inquiry').trim().slice(0, 200),
+      message: String(message).trim().slice(0, 4000),
+      createdAt: new Date().toISOString(),
+    });
+    return res.json({
+      success: true,
+      message: 'Your concierge inquiry has been securely delivered.',
+    });
+  } catch (err) {
+    console.error('[Contact Error]', (err as Error)?.message || err);
+    return res.status(500).json({ error: 'Failed to record concierge inquiry.' });
   }
-  db.contactMessages.push({
-    id: 'msg_' + Date.now(),
-    name: String(name).trim(),
-    email: String(email).trim().toLowerCase(),
-    subject: String(subject || 'General Concierge Inquiry').trim(),
-    message: String(message).trim(),
-    createdAt: new Date().toISOString(),
-  });
-  saveDb(db);
-  return res.json({ success: true, message: 'Your concierge inquiry has been securely delivered.' });
 });
 
 app.get('/api/health', (_req, res) => {
-  res.json({ status: 'healthy', brand: 'RGD LUXE', timestamp: new Date().toISOString() });
+  res.json({
+    status: 'healthy',
+    brand: 'RGD LUXE',
+    timestamp: new Date().toISOString(),
+  });
 });
 
 // --- VITE & STATIC SERVING ---
 async function startServer() {
-  await syncProductsFromFirestoreRest(true);
+  const initStatus = await store.init();
+  if (initStatus.mode !== 'firestore') {
+    await syncProductsFromFirestoreRest(true);
+  }
 
   app.use('/public', express.static(path.join(__dirname, 'public')));
   app.use('/src/assets', express.static(path.join(__dirname, 'src', 'assets')));

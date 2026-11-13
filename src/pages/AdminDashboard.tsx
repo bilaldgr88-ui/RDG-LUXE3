@@ -39,7 +39,6 @@ import {
 } from 'lucide-react';
 import { compressImageFileToDataUrl } from '../utils/imageOptimizer';
 import {
-  BOOTSTRAPPED_CLOUD_ADMIN_EMAIL,
   deleteProductFromFirestore,
   saveProductToFirestore,
 } from '../utils/firestoreCatalog';
@@ -80,6 +79,7 @@ export const AdminDashboard: React.FC = () => {
     hasPrivateRecoveryEmail: boolean;
     emailServiceConfigured: boolean;
     emailProvider: string;
+    persistenceMode?: string;
   } | null>(null);
   const [newEmailInput, setNewEmailInput] = useState('');
   const [emailCurrentPassword, setEmailCurrentPassword] = useState('');
@@ -195,9 +195,10 @@ export const AdminDashboard: React.FC = () => {
   // Handle Delete Product
   const handleDeleteProduct = async (id: string, name: string) => {
     if (!isAdminAuthenticated) return;
-    if (cloudCatalog.seeded && !cloudCatalog.authorized) {
+    const serverFirestoreActive = securityInfo?.persistenceMode === 'firestore';
+    if (!serverFirestoreActive && cloudCatalog.seeded && !cloudCatalog.authorized) {
       showToast(
-        `Connect Google Cloud Sync (${BOOTSTRAPPED_CLOUD_ADMIN_EMAIL}) first so deletion persists permanently.`,
+        'Connect an authorized Google Admin account first so deletion persists permanently.',
         'error'
       );
       return;
@@ -493,9 +494,10 @@ export const AdminDashboard: React.FC = () => {
       cloudReady = true;
     }
 
-    if (cloudCatalog.seeded && !cloudReady) {
+    const serverFirestoreActive = securityInfo?.persistenceMode === 'firestore';
+    if (!serverFirestoreActive && cloudCatalog.seeded && !cloudReady) {
       setFormError(
-        `Cloud Database Sync (${BOOTSTRAPPED_CLOUD_ADMIN_EMAIL}) is required so changes persist permanently and aren't overwritten. Click "Connect Google & Save" below.`
+        'Authorized Google Admin Cloud Sync is required so changes persist permanently and aren\'t overwritten. Click "Connect Google & Save" below.'
       );
       return;
     }
@@ -576,6 +578,12 @@ export const AdminDashboard: React.FC = () => {
           editingProduct
             ? 'Product updated and saved permanently in Cloud Vault.'
             : 'New product saved permanently in Cloud Vault.'
+        );
+      } else if (serverFirestoreActive) {
+        showToast(
+          editingProduct
+            ? 'Product updated and persisted in Cloud Firestore.'
+            : 'New product saved permanently in Cloud Firestore.'
         );
       } else {
         showToast(
@@ -930,7 +938,7 @@ export const AdminDashboard: React.FC = () => {
               <p className="text-neutral-400 mt-0.5 leading-relaxed">
                 {cloudCatalog.authorized
                   ? `All products, discounts, deletions, and uploaded images sync permanently to Cloud Firestore (${cloudCatalog.firestoreCount} stored items) across page reloads and server restarts.`
-                  : `Sign in once with your authorized Google account (${BOOTSTRAPPED_CLOUD_ADMIN_EMAIL}) to permanently store new products and photos in Cloud Firestore across reloads and idle restarts.`}
+                  : 'Sign in with an administrator-authorized Google account to permanently store new products and photos in Cloud Firestore across reloads and idle restarts.'}
               </p>
               {cloudNotice && <p className="text-red-400 mt-1">{cloudNotice}</p>}
             </div>

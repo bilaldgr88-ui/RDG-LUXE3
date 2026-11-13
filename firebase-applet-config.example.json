@@ -1,0 +1,12 @@
+{
+  "projectId": "YOUR_RGD_LUXE3_PROJECT_ID",
+  "appId": "YOUR_RGD_LUXE3_WEB_APP_ID",
+  "apiKey": "YOUR_RGD_LUXE3_WEB_API_KEY",
+  "authDomain": "YOUR_RGD_LUXE3_PROJECT_ID.firebaseapp.com",
+  "firestoreDatabaseId": "(default)",
+  "storageBucket": "YOUR_RGD_LUXE3_PROJECT_ID.firebasestorage.app",
+  "messagingSenderId": "YOUR_SENDER_ID",
+  "measurementId": "",
+  "oAuthClientId": "",
+  "recaptchaSiteKey": ""
+}

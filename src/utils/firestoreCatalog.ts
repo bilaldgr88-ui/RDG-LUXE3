@@ -21,12 +21,15 @@ import {
   type ProductWithSort,
 } from './productCatalog';
 
-export const BOOTSTRAPPED_CLOUD_ADMIN_EMAIL = 'bilaldgr88@gmail.com';
-
 export async function isAuthorizedCloudAdmin(user: User | null): Promise<boolean> {
   if (!user || !user.emailVerified) return false;
-  if (user.email?.toLowerCase() === BOOTSTRAPPED_CLOUD_ADMIN_EMAIL) {
-    return true;
+  try {
+    const tokenResult = await user.getIdTokenResult();
+    if (tokenResult.claims?.admin === true) {
+      return true;
+    }
+  } catch {
+    // Fall back to server-managed admins RBAC lookup
   }
   try {
     const adminSnap = await getDoc(doc(db, 'admins', user.uid));
@@ -44,23 +47,28 @@ export async function connectAdminGoogleCloudSync(): Promise<{
   try {
     const cred = await signInWithPopup(auth, googleProvider);
     const user = cred.user;
+
+    // Ask authenticated Express admin session to grant server-verified /admins/{uid} & custom claim
+    try {
+      const idToken = await user.getIdToken();
+      await fetch('/api/admin/cloud-sync-claim', {
+        method: 'POST',
+        credentials: 'include',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ idToken }),
+      });
+      await user.getIdToken(true);
+    } catch {
+      // Fall back to existing claim/RBAC verification
+    }
+
     const allowed = await isAuthorizedCloudAdmin(user);
     if (!allowed) {
       await signOut(auth);
       return {
         success: false,
-        error: `Google account "${user.email || 'unknown'}" is not authorized for RGD LUXE cloud catalog writes. Please sign in with ${BOOTSTRAPPED_CLOUD_ADMIN_EMAIL}.`,
+        error: `Google account "${user.email || 'unknown'}" is not authorized with administrator claims in Firestore.`,
       };
-    }
-
-    // Ensure admin record doc exists for RBAC transparency
-    const adminRef = doc(db, 'admins', user.uid);
-    const adminSnap = await getDoc(adminRef);
-    if (!adminSnap.exists()) {
-      await setDoc(adminRef, {
-        email: (user.email || '').toLowerCase(),
-        createdAt: serverTimestamp(),
-      });
     }
 
     return { success: true, user };

@@ -205,6 +205,18 @@
         }
       },
       "required": ["email", "createdAt"]
+    },
+    "PrivateServerRecord": {
+      "title": "PrivateServerRecord",
+      "description": "Server-managed private collection record accessible strictly via Firebase Admin SDK.",
+      "type": "object",
+      "properties": {
+        "id": {
+          "type": "string",
+          "description": "Document identifier."
+        }
+      },
+      "required": ["id"]
     }
   },
   "firestore": {
@@ -219,6 +231,34 @@
     "/admins/{adminUid}": {
       "schema": { "$ref": "#/entities/AdminRecord" },
       "description": "Server-verified administrator directory isolating RBAC privileges."
+    },
+    "/users/{userId}": {
+      "schema": { "$ref": "#/entities/PrivateServerRecord" },
+      "description": "Server-only customer and administrator accounts (scrypt password hashes, private recovery email)."
+    },
+    "/orders/{orderId}": {
+      "schema": { "$ref": "#/entities/PrivateServerRecord" },
+      "description": "Server-only customer orders and dispatch records."
+    },
+    "/sessions/{sessionId}": {
+      "schema": { "$ref": "#/entities/PrivateServerRecord" },
+      "description": "Server-only SHA-256 hashed HttpOnly session records."
+    },
+    "/password_reset_otps/{otpId}": {
+      "schema": { "$ref": "#/entities/PrivateServerRecord" },
+      "description": "Server-only 5-minute single-use password reset OTP records."
+    },
+    "/subscribers/{subId}": {
+      "schema": { "$ref": "#/entities/PrivateServerRecord" },
+      "description": "Server-only newsletter subscriber emails."
+    },
+    "/contact_messages/{msgId}": {
+      "schema": { "$ref": "#/entities/PrivateServerRecord" },
+      "description": "Server-only concierge contact form submissions."
+    },
+    "/app_settings/{settingId}": {
+      "schema": { "$ref": "#/entities/PrivateServerRecord" },
+      "description": "Server-only migration state and security configuration metadata."
     }
   }
 }

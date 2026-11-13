@@ -28,13 +28,11 @@ service cloud.firestore {
       return isSignedIn() && request.auth.token.email_verified == true;
     }
 
-    function isBootstrappedAdmin() {
-      return isVerifiedUser() && request.auth.token.email == 'bilaldgr88@gmail.com';
-    }
-
     function isAdmin() {
-      return isBootstrappedAdmin() ||
-        (isVerifiedUser() && exists(/databases/$(database)/documents/admins/$(request.auth.uid)));
+      return isVerifiedUser() && (
+        request.auth.token.admin == true ||
+        exists(/databases/$(database)/documents/admins/$(request.auth.uid))
+      );
     }
 
     function productAllowedKeys() {
@@ -113,13 +111,6 @@ service cloud.firestore {
         && data.updatedAt is timestamp;
     }
 
-    function isValidAdminRecord(data) {
-      return data.keys().hasAll(['email', 'createdAt'])
-        && data.keys().hasOnly(['email', 'createdAt'])
-        && data.email is string && data.email.size() >= 3 && data.email.size() <= 180
-        && data.createdAt is timestamp;
-    }
-
     // Public Storefront Product Catalog (No PII; Admin-only mutations)
     match /products/{productId} {
       allow get: if isValidId(productId);
@@ -184,16 +175,40 @@ service cloud.firestore {
       allow delete: if false;
     }
 
-    // Admin RBAC Directory (Strict PII & Role Protection)
+    // Admin RBAC Directory (Strict PII & Role Protection — Server-Managed Only)
     match /admins/{adminUid} {
       allow get: if isValidId(adminUid) && (isAdmin() || (isVerifiedUser() && request.auth.uid == adminUid));
       allow list: if isAdmin();
-      allow create: if isAdmin()
-        && isValidId(adminUid)
-        && isValidAdminRecord(incoming())
-        && incoming().createdAt == request.time;
-      allow update: if false;
-      allow delete: if isBootstrappedAdmin() && isValidId(adminUid);
+      allow create, update, delete: if false;
+    }
+
+    // Strictly Private Backend-Only Collections (Inaccessible to All Client SDKs)
+    match /users/{userId} {
+      allow read, write: if false;
+    }
+
+    match /orders/{orderId} {
+      allow read, write: if false;
+    }
+
+    match /sessions/{sessionId} {
+      allow read, write: if false;
+    }
+
+    match /password_reset_otps/{otpId} {
+      allow read, write: if false;
+    }
+
+    match /subscribers/{subId} {
+      allow read, write: if false;
+    }
+
+    match /contact_messages/{msgId} {
+      allow read, write: if false;
+    }
+
+    match /app_settings/{settingId} {
+      allow read, write: if false;
     }
   }
 }
